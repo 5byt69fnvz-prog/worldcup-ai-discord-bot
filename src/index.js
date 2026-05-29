@@ -120,7 +120,6 @@ async function fetchApiFootballMatches() {
   const params = new URLSearchParams({
     league: config.apiFootballLeagueId,
     season: config.apiFootballSeason,
-    next: "10",
   });
 
   const response = await fetch(`https://v3.football.api-sports.io/fixtures?${params}`, {
@@ -134,9 +133,17 @@ async function fetchApiFootballMatches() {
   }
 
   const data = await response.json();
-  const fixtures = Array.isArray(data.response) ? data.response : [];
+  const apiErrors = Array.isArray(data.errors)
+    ? data.errors
+    : Object.values(data.errors || {}).filter(Boolean);
+  if (apiErrors.length) {
+    throw new Error(`API-Football error: ${apiErrors.join(" | ")}`);
+  }
 
-  return fixtures.map((item) => {
+  const fixtures = Array.isArray(data.response) ? data.response : [];
+  console.log(`API-Football returned ${fixtures.length} World Cup fixtures.`);
+
+  const matches = fixtures.map((item) => {
     const homeGoals = item.goals?.home;
     const awayGoals = item.goals?.away;
     return {
@@ -148,6 +155,27 @@ async function fetchApiFootballMatches() {
       venue: item.fixture?.venue?.name || "Venue TBA",
     };
   });
+
+  const now = Date.now();
+  const liveStatuses = new Set(["1H", "HT", "2H", "ET", "BT", "P", "SUSP", "INT", "LIVE"]);
+  const statusPriority = (match) => {
+    if (liveStatuses.has(match.status)) return 0;
+    if (match.kickoff.getTime() >= now) return 1;
+    return 2;
+  };
+
+  return matches
+    .sort((a, b) => {
+      const priorityDifference = statusPriority(a) - statusPriority(b);
+      if (priorityDifference !== 0) return priorityDifference;
+
+      if (statusPriority(a) === 2) {
+        return b.kickoff.getTime() - a.kickoff.getTime();
+      }
+
+      return a.kickoff.getTime() - b.kickoff.getTime();
+    })
+    .slice(0, 10);
 }
 
 async function fetchMatches() {
