@@ -133,7 +133,15 @@ async function fetchApiFootballMatches() {
   }
 
   const data = await response.json();
+  const apiErrors = Array.isArray(data.errors)
+    ? data.errors
+    : Object.values(data.errors || {}).filter(Boolean);
+  if (apiErrors.length) {
+    throw new Error(`API-Football error: ${apiErrors.join(" | ")}`);
+  }
+
   const fixtures = Array.isArray(data.response) ? data.response : [];
+  console.log(`API-Football returned ${fixtures.length} World Cup fixtures.`);
 
   const matches = fixtures.map((item) => {
     const homeGoals = item.goals?.home;
