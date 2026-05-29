@@ -6,6 +6,10 @@ loadEnv();
 
 const DISCORD_API = "https://discord.com/api/v10";
 const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
+const FIFA_MATCH_CENTER_URL =
+  "https://www.fifa.com/en/tournaments/mens/worldcup/canadamexicousa2026/match-center";
+const THESPORTSDB_API = "https://www.thesportsdb.com/api/v1/json/123";
+const THESPORTSDB_WORLD_CUP_ID = "4429";
 
 const config = {
   token: process.env.DISCORD_TOKEN,
@@ -28,6 +32,7 @@ let sessionId = null;
 let lastAutoPostSignature = "";
 let botUserId = null;
 let healthServer = null;
+let lastDataSourceLabel = "Official 2026 schedule";
 
 function loadEnv() {
   const envPath = path.join(__dirname, "..", ".env");
@@ -114,6 +119,85 @@ function getDemoMatches() {
   ];
 }
 
+function getVerified2026PreviewMatches() {
+  return [
+    {
+      home: "Mexico",
+      away: "South Africa",
+      status: "Opening match",
+      kickoff: new Date("2026-06-11T19:00:00Z"),
+      score: "-",
+      venue: "Estadio Azteca",
+    },
+  ];
+}
+
+function getLocalDateKey() {
+  const parts = new Intl.DateTimeFormat("en", {
+    timeZone: config.timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function mapTheSportsDbMatch(event, fallbackStatus = "Scheduled") {
+  const timestamp = event.strTimestamp || `${event.dateEvent}T${event.strTime || "00:00:00"}`;
+  const kickoff = new Date(timestamp.endsWith("Z") ? timestamp : `${timestamp}Z`);
+  const homeScore = event.intHomeScore;
+  const awayScore = event.intAwayScore;
+
+  return {
+    home: event.strHomeTeam || "Home",
+    away: event.strAwayTeam || "Away",
+    status: event.strStatus === "NS" ? fallbackStatus : event.strStatus || fallbackStatus,
+    kickoff,
+    score:
+      homeScore === null || homeScore === "" || awayScore === null || awayScore === ""
+        ? "-"
+        : `${homeScore}-${awayScore}`,
+    venue: event.strVenue || "Venue TBA",
+  };
+}
+
+async function fetchTheSportsDbFreeMatches() {
+  const today = getLocalDateKey();
+  const dayResponse = await fetch(
+    `${THESPORTSDB_API}/eventsday.php?d=${today}&l=${THESPORTSDB_WORLD_CUP_ID}`,
+  );
+  if (!dayResponse.ok) {
+    throw new Error(`TheSportsDB request failed: ${dayResponse.status} ${dayResponse.statusText}`);
+  }
+
+  const dayData = await dayResponse.json();
+  const dayEvents = Array.isArray(dayData.events) ? dayData.events : [];
+  if (dayEvents.length) {
+    lastDataSourceLabel = "Official 2026 schedule";
+    console.log(`TheSportsDB returned ${dayEvents.length} World Cup fixtures for ${today}.`);
+    return dayEvents.map((event) => mapTheSportsDbMatch(event));
+  }
+
+  const nextResponse = await fetch(
+    `${THESPORTSDB_API}/eventsnextleague.php?id=${THESPORTSDB_WORLD_CUP_ID}`,
+  );
+  if (!nextResponse.ok) {
+    throw new Error(`TheSportsDB request failed: ${nextResponse.status} ${nextResponse.statusText}`);
+  }
+
+  const nextData = await nextResponse.json();
+  const nextEvents = Array.isArray(nextData.events) ? nextData.events : [];
+  if (!nextEvents.length) {
+    console.log("TheSportsDB returned no upcoming World Cup fixtures. Using verified opening match.");
+    return getVerified2026PreviewMatches();
+  }
+
+  lastDataSourceLabel = "Official 2026 schedule";
+  console.log(`TheSportsDB returned ${nextEvents.length} upcoming World Cup fixture.`);
+  return nextEvents.map((event) => mapTheSportsDbMatch(event, "Next official fixture"));
+}
+
 async function fetchApiFootballMatches() {
   requireEnv(config.apiFootballKey, "API_FOOTBALL_KEY");
 
@@ -141,6 +225,7 @@ async function fetchApiFootballMatches() {
   }
 
   const fixtures = Array.isArray(data.response) ? data.response : [];
+  lastDataSourceLabel = "Live football data";
   console.log(`API-Football returned ${fixtures.length} World Cup fixtures.`);
 
   const matches = fixtures.map((item) => {
@@ -180,9 +265,25 @@ async function fetchApiFootballMatches() {
 
 async function fetchMatches() {
   if (config.provider === "api-football") {
-    return fetchApiFootballMatches();
+    try {
+      return await fetchApiFootballMatches();
+    } catch (error) {
+      console.warn(`API-Football unavailable. Using free official schedule fallback: ${error.message}`);
+      return fetchTheSportsDbFreeMatches().catch((fallbackError) => {
+        console.warn(`TheSportsDB unavailable. Using verified opening match: ${fallbackError.message}`);
+        return getVerified2026PreviewMatches();
+      });
+    }
   }
 
+  if (config.provider === "thesportsdb") {
+    return fetchTheSportsDbFreeMatches().catch((error) => {
+      console.warn(`TheSportsDB unavailable. Using verified opening match: ${error.message}`);
+      return getVerified2026PreviewMatches();
+    });
+  }
+
+  lastDataSourceLabel = "Demo data";
   return getDemoMatches();
 }
 
@@ -209,7 +310,9 @@ function buildTemplateBriefing(matches) {
   const bullets = [
     lead,
     "Fans can use #match-chat for reactions and predictions.",
-    "This briefing is ready to connect to a real football API when you add an API key.",
+    lastDataSourceLabel === "Live football data"
+      ? "Live football data is connected."
+      : "Verified 2026 schedule mode is active. Live scores can be added closer to kickoff.",
   ];
 
   return bullets.map((line) => `- ${line}`).join("\n");
@@ -427,9 +530,13 @@ async function createBriefingEmbed() {
         name: "Upcoming / Live Matches",
         value: buildMatchLines(matches).join("\n\n").slice(0, 1024),
       },
+      {
+        name: "Official World Cup 26 Schedule",
+        value: `[FIFA Match Center](${FIFA_MATCH_CENTER_URL})`,
+      },
     ],
     footer: {
-      text: `World Cup AI Club | ${config.provider === "demo" ? "Demo data" : "Live football data"}`,
+      text: `World Cup AI Club | ${lastDataSourceLabel}`,
     },
     timestamp: new Date().toISOString(),
   };
