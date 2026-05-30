@@ -23,6 +23,8 @@ const config = {
   apiFootballLeagueId: process.env.API_FOOTBALL_LEAGUE_ID || "1",
   apiFootballSeason: process.env.API_FOOTBALL_SEASON || "2026",
   openAiKey: process.env.OPENAI_API_KEY,
+  telegramToken: process.env.TELEGRAM_BOT_TOKEN,
+  telegramChatId: process.env.TELEGRAM_CHAT_ID,
 };
 
 let socket;
@@ -33,6 +35,8 @@ let lastAutoPostSignature = "";
 let botUserId = null;
 let healthServer = null;
 let lastDataSourceLabel = "Official 2026 schedule";
+let telegramOffset = 0;
+let telegramBotUsername = "";
 
 function loadEnv() {
   const envPath = path.join(__dirname, "..", ".env");
@@ -419,7 +423,14 @@ function pick(options) {
 }
 
 function getDisplayName(message) {
-  return message?.member?.nick || message?.author?.global_name || message?.author?.username || "friend";
+  return (
+    message?.member?.nick ||
+    message?.author?.global_name ||
+    message?.author?.username ||
+    message?.from?.first_name ||
+    message?.from?.username ||
+    "friend"
+  );
 }
 
 function buildHumanTemplateAnswer(question, matches, displayName) {
@@ -517,9 +528,9 @@ async function buildChatAnswer(question, message = null) {
   return buildHumanTemplateAnswer(question, matches, getDisplayName(message));
 }
 
-async function createBriefingEmbed() {
-  const matches = await fetchMatches();
-  const briefing = await buildOpenAiBriefing(matches);
+async function createBriefingEmbed(existingMatches = null, existingBriefing = null) {
+  const matches = existingMatches || (await fetchMatches());
+  const briefing = existingBriefing || (await buildOpenAiBriefing(matches));
 
   return {
     color: 0xf0c45c,
@@ -540,6 +551,26 @@ async function createBriefingEmbed() {
     },
     timestamp: new Date().toISOString(),
   };
+}
+
+function removeDiscordMarkdown(text) {
+  return text.replace(/\*\*/g, "").replace(/^- /gm, "• ");
+}
+
+function buildTelegramBriefing(matches, briefing) {
+  return [
+    "World Cup AI Briefing",
+    "",
+    removeDiscordMarkdown(briefing),
+    "",
+    "Upcoming / Live Matches",
+    removeDiscordMarkdown(buildMatchLines(matches).join("\n\n")),
+    "",
+    "Official World Cup 26 Schedule",
+    FIFA_MATCH_CENTER_URL,
+    "",
+    `World Cup AI Club | ${lastDataSourceLabel}`,
+  ].join("\n");
 }
 
 async function discordRequest(endpoint, options = {}) {
@@ -572,6 +603,146 @@ async function sendTyping(channelId) {
   await discordRequest(`/channels/${channelId}/typing`, {
     method: "POST",
   });
+}
+
+async function telegramRequest(method, payload = {}) {
+  const response = await fetch(`https://api.telegram.org/bot${config.telegramToken}/${method}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json();
+
+  if (!response.ok || !data.ok) {
+    throw new Error(`Telegram ${method} failed: ${data.description || response.statusText}`);
+  }
+
+  return data.result;
+}
+
+async function telegramSendMessage(chatId, text) {
+  return telegramRequest("sendMessage", {
+    chat_id: chatId,
+    text: text.slice(0, 4000),
+    disable_web_page_preview: true,
+  });
+}
+
+async function telegramSendTyping(chatId) {
+  return telegramRequest("sendChatAction", {
+    chat_id: chatId,
+    action: "typing",
+  });
+}
+
+async function createTelegramBriefing() {
+  const matches = await fetchMatches();
+  const briefing = await buildOpenAiBriefing(matches);
+  return buildTelegramBriefing(matches, briefing);
+}
+
+async function handleTelegramMessage(message) {
+  const text = message.text?.trim();
+  if (!text) return;
+
+  const chatId = message.chat.id;
+  const command = text.match(/^\/([a-z]+)(?:@\w+)?(?:\s|$)/i)?.[1]?.toLowerCase();
+
+  if (command === "ping") {
+    await telegramSendMessage(chatId, "World Cup AI Bot is online.");
+    return;
+  }
+
+  if (command === "chatid") {
+    await telegramSendMessage(chatId, `Telegram chat ID: ${chatId}`);
+    return;
+  }
+
+  if (command === "help" || command === "start") {
+    await telegramSendMessage(
+      chatId,
+      [
+        "World Cup AI Bot commands:",
+        "/ping - check bot status",
+        "/today - show matches",
+        "/briefing - show the World Cup briefing",
+        "/chatid - show this group's Telegram chat ID",
+        "",
+        "You can also ask me football questions directly in private chat.",
+      ].join("\n"),
+    );
+    return;
+  }
+
+  if (command === "today") {
+    const matches = await fetchMatches();
+    await telegramSendMessage(chatId, removeDiscordMarkdown(buildMatchLines(matches).join("\n\n")));
+    return;
+  }
+
+  if (command === "briefing") {
+    await telegramSendMessage(chatId, await createTelegramBriefing());
+    return;
+  }
+
+  const isPrivateChat = message.chat.type === "private";
+  const mentioned = telegramBotUsername
+    ? text.toLowerCase().includes(`@${telegramBotUsername.toLowerCase()}`)
+    : false;
+  const repliedToBot =
+    telegramBotUsername &&
+    message.reply_to_message?.from?.username?.toLowerCase() === telegramBotUsername.toLowerCase();
+  if (!isPrivateChat && !mentioned && !repliedToBot) return;
+
+  const question = telegramBotUsername
+    ? text.replace(new RegExp(`@${telegramBotUsername}`, "gi"), "").trim()
+    : text;
+  await telegramSendTyping(chatId).catch(() => {});
+  const answer = await buildChatAnswer(question || "help", message);
+  await telegramSendMessage(chatId, removeDiscordMarkdown(answer));
+}
+
+async function startTelegramBot() {
+  if (!config.telegramToken) {
+    console.log("TELEGRAM_BOT_TOKEN is empty. Telegram bot is disabled.");
+    return;
+  }
+
+  const bot = await telegramRequest("getMe");
+  telegramBotUsername = bot.username || "";
+  console.log(`Telegram bot logged in as @${telegramBotUsername}.`);
+
+  await telegramRequest("setMyCommands", {
+    commands: [
+      { command: "ping", description: "Check whether the bot is online" },
+      { command: "today", description: "Show World Cup matches" },
+      { command: "briefing", description: "Show the World Cup briefing" },
+      { command: "help", description: "Show bot commands" },
+      { command: "chatid", description: "Show this Telegram chat ID" },
+    ],
+  });
+
+  while (true) {
+    try {
+      const updates = await telegramRequest("getUpdates", {
+        offset: telegramOffset,
+        timeout: 25,
+        allowed_updates: ["message"],
+      });
+
+      for (const update of updates) {
+        telegramOffset = update.update_id + 1;
+        if (update.message) {
+          await handleTelegramMessage(update.message);
+        }
+      }
+    } catch (error) {
+      console.error("Telegram polling failed:", error.message);
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+  }
 }
 
 async function replyToMessage(message, content) {
@@ -609,12 +780,16 @@ async function replyToInteraction(interaction, payload, ephemeral = false) {
 }
 
 async function postAutomaticBriefing() {
-  if (!config.channelId || config.channelId.startsWith("PASTE_")) {
-    console.log("DISCORD_CHANNEL_ID is empty. Automatic posting is disabled.");
+  const hasDiscordChannel = config.channelId && !config.channelId.startsWith("PASTE_");
+  const hasTelegramChat = config.telegramToken && config.telegramChatId;
+  if (!hasDiscordChannel && !hasTelegramChat) {
+    console.log("No Discord or Telegram channel ID is configured. Automatic posting is disabled.");
     return;
   }
 
-  const embed = await createBriefingEmbed();
+  const matches = await fetchMatches();
+  const briefing = await buildOpenAiBriefing(matches);
+  const embed = await createBriefingEmbed(matches, briefing);
   const signature = JSON.stringify(embed.fields || []);
   if (signature === lastAutoPostSignature) {
     console.log("No new briefing content. Skipping duplicate post.");
@@ -622,7 +797,12 @@ async function postAutomaticBriefing() {
   }
 
   lastAutoPostSignature = signature;
-  await postChannelMessage(config.channelId, { embeds: [embed] });
+  if (hasDiscordChannel) {
+    await postChannelMessage(config.channelId, { embeds: [embed] });
+  }
+  if (hasTelegramChat) {
+    await telegramSendMessage(config.telegramChatId, buildTelegramBriefing(matches, briefing));
+  }
   console.log("Posted automatic football briefing.");
 }
 
@@ -763,6 +943,9 @@ setInterval(() => {
 }, Math.max(config.intervalMinutes, 5) * 60 * 1000);
 
 connectGateway();
+startTelegramBot().catch((error) => {
+  console.error("Telegram bot failed to start:", error.message);
+});
 
 module.exports = {
   buildTemplateBriefing,
