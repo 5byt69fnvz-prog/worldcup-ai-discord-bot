@@ -12,6 +12,7 @@ const THESPORTSDB_API = "https://www.thesportsdb.com/api/v1/json/123";
 const THESPORTSDB_WORLD_CUP_ID = "4429";
 
 const config = {
+  discordEnabled: process.env.DISCORD_ENABLED !== "false",
   token: process.env.DISCORD_TOKEN,
   channelId: process.env.DISCORD_CHANNEL_ID,
   intervalMinutes: Number(process.env.UPDATE_INTERVAL_MINUTES || 60),
@@ -76,7 +77,16 @@ function startHealthServer() {
       JSON.stringify({
         ok: true,
         service: "World Cup AI Bot",
-        discord: socket?.readyState === WebSocket.OPEN ? "connected" : "connecting",
+        discord: config.discordEnabled
+          ? socket?.readyState === WebSocket.OPEN
+            ? "connected"
+            : "connecting"
+          : "disabled",
+        telegram: config.telegramToken
+          ? telegramBotUsername
+            ? "connected"
+            : "connecting"
+          : "disabled",
       }),
     );
   });
@@ -349,7 +359,7 @@ async function buildOpenAiBriefing(matches) {
         {
           role: "system",
           content:
-            "You write short English football briefings for a global Discord community. Be accurate, exciting, and concise.",
+            "You write short English football briefings for a global football community. Be accurate, exciting, and concise.",
         },
         {
           role: "user",
@@ -393,7 +403,7 @@ async function buildOpenAiAnswer(question, matches) {
         {
           role: "system",
           content:
-            "You are World Cup AI Bot in a Discord football community. Sound warm, human, and match-room smart. Reply in short friendly English unless the user writes Chinese, then reply in simple Chinese. Be honest when data is demo data. Do not pretend to know live results unless fixture data says so.",
+            "You are World Cup AI Bot in a global football community. Sound warm, human, and match-room smart. Reply in short friendly English unless the user writes Chinese, then reply in simple Chinese. Be honest when data is demo data. Do not pretend to know live results unless fixture data says so.",
         },
         {
           role: "user",
@@ -757,6 +767,10 @@ async function startTelegramBot() {
     ],
   });
 
+  postAutomaticBriefing().catch((error) => {
+    console.error("Initial Telegram briefing failed:", error.message);
+  });
+
   while (true) {
     try {
       const updates = await telegramRequest("getUpdates", {
@@ -825,7 +839,8 @@ async function replyToInteraction(interaction, payload, ephemeral = false) {
 }
 
 async function postAutomaticBriefing() {
-  const hasDiscordChannel = config.channelId && !config.channelId.startsWith("PASTE_");
+  const hasDiscordChannel =
+    config.discordEnabled && config.token && config.channelId && !config.channelId.startsWith("PASTE_");
   const hasTelegramChat = config.telegramToken && config.telegramChatId;
   if (!hasDiscordChannel && !hasTelegramChat) {
     console.log("No Discord or Telegram channel ID is configured. Automatic posting is disabled.");
@@ -985,7 +1000,14 @@ function connectGateway() {
   });
 }
 
-requireEnv(config.token, "DISCORD_TOKEN");
+if (!config.discordEnabled && !config.telegramToken) {
+  throw new Error("Enable Discord or add TELEGRAM_BOT_TOKEN.");
+}
+
+if (config.discordEnabled) {
+  requireEnv(config.token, "DISCORD_TOKEN");
+}
+
 startHealthServer();
 
 setInterval(() => {
@@ -994,7 +1016,12 @@ setInterval(() => {
   });
 }, Math.max(config.intervalMinutes, 5) * 60 * 1000);
 
-connectGateway();
+if (config.discordEnabled) {
+  connectGateway();
+} else {
+  console.log("Discord bot is disabled. Running Telegram-only mode.");
+}
+
 startTelegramBot().catch((error) => {
   console.error("Telegram bot failed to start:", error.message);
 });
