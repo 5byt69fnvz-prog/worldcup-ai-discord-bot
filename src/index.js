@@ -18,6 +18,7 @@ const config = {
   port: Number(process.env.PORT || 10000),
   timezone: process.env.TIMEZONE || "Asia/Kuala_Lumpur",
   autoReply: process.env.DISCORD_AUTO_REPLY || "mention",
+  discordWelcomeEnabled: process.env.DISCORD_WELCOME_ENABLED === "true",
   provider: process.env.FOOTBALL_PROVIDER || "demo",
   apiFootballKey: process.env.API_FOOTBALL_KEY,
   apiFootballLeagueId: process.env.API_FOOTBALL_LEAGUE_ID || "1",
@@ -557,6 +558,31 @@ function removeDiscordMarkdown(text) {
   return text.replace(/\*\*/g, "").replace(/^- /gm, "• ");
 }
 
+function buildWelcomeMessage(platform) {
+  const personalQuestion =
+    platform === "telegram"
+      ? `Telegram group: @${telegramBotUsername || "your_bot_username"} What is the next match?`
+      : "Discord: @World Cup AI Bot What is the next match?";
+
+  return [
+    "Welcome to World Cup AI Club.",
+    "",
+    "Ask the bot for World Cup updates:",
+    "",
+    "/ping - Check whether the bot is online",
+    "/today - View upcoming matches",
+    "/briefing - Read the latest football briefing",
+    "/help - View commands",
+    "",
+    "For a personal football question:",
+    personalQuestion,
+    "",
+    platform === "telegram"
+      ? "You can also reply directly to the Telegram bot's message."
+      : "Mention @World Cup AI Bot before your question.",
+  ].join("\n");
+}
+
 function buildTelegramBriefing(matches, briefing) {
   return [
     "World Cup AI Briefing",
@@ -644,6 +670,13 @@ async function createTelegramBriefing() {
 }
 
 async function handleTelegramMessage(message) {
+  const newMembers = Array.isArray(message.new_chat_members) ? message.new_chat_members : [];
+  const humanMembers = newMembers.filter((member) => !member.is_bot);
+  if (humanMembers.length) {
+    await telegramSendMessage(message.chat.id, buildWelcomeMessage("telegram"));
+    return;
+  }
+
   const text = message.text?.trim();
   if (!text) return;
 
@@ -761,6 +794,18 @@ async function replyToMessage(message, content) {
   });
 }
 
+async function welcomeDiscordMember(member) {
+  if (!config.discordWelcomeEnabled || member.user?.bot) return;
+  if (!config.channelId || config.channelId.startsWith("PASTE_")) return;
+
+  await postChannelMessage(config.channelId, {
+    content: `<@${member.user.id}>\n\n${buildWelcomeMessage("discord")}`,
+    allowed_mentions: {
+      users: [member.user.id],
+    },
+  });
+}
+
 async function replyToInteraction(interaction, payload, ephemeral = false) {
   const data = typeof payload === "string" ? { content: payload } : payload;
   if (ephemeral) {
@@ -865,11 +910,12 @@ function startHeartbeat(interval) {
 }
 
 function identify() {
+  const intents = 1 | 512 | (config.discordWelcomeEnabled ? 2 : 0);
   send({
     op: 2,
     d: {
       token: config.token,
-      intents: 1 | 512,
+      intents,
       properties: {
         os: "windows",
         browser: "worldcup-ai-bot",
@@ -918,6 +964,12 @@ function connectGateway() {
     if (packet.t === "MESSAGE_CREATE") {
       handleMessage(packet.d).catch((error) => {
         console.error("Message reply failed:", error.message);
+      });
+    }
+
+    if (packet.t === "GUILD_MEMBER_ADD") {
+      welcomeDiscordMember(packet.d).catch((error) => {
+        console.error("Discord welcome failed:", error.message);
       });
     }
   });
